@@ -1,0 +1,881 @@
+---
+title: "Omics_PEC2"
+author: "Judith Guitart"
+date: "1/6/2020"
+output:
+  html_document: default
+  word_document: default
+---
+
+
+# Preparación de los datos
+
+Primeramente se leen los archivos 'targets.csv' y 'counts.csv' que se encuentran en la carpeta 'Datos' dentro de la carpeta 'PEC2' de la asignatura, establecida como el directorio principal de este análisis.
+
+```{r}
+targets <- read.csv("./Datos/targets.csv", header = TRUE, sep = ",", row.names=1)
+head(targets)
+```
+
+```{r}
+counts <- read.csv("./Datos/counts.csv", header = TRUE, sep = ";", row.names = 1)
+```
+
+
+
+A continuación, se extraen 10 muestras de cada uno de los grupos (NIT, SFI y ELI) de manera aleatoria del archivo 'targets.csv' mediante el paquete dplyr:
+
+```{r}
+library(dplyr)
+set.seed(3333)
+targets.pec <- targets %>% group_by(Group) %>% sample_n(10) %>% arrange(Grupo_analisis)
+str(targets.pec)
+```
+
+
+Se observa que el output es el deseado.
+
+
+
+
+A continuación, se quiere subsetear estas muestras escogidas en las columnas del archivo 'counts.csv' para obtener la información adecuada de cada una de las muestras.
+
+Para ello, es necesario que los nombres de la columna 'Sample_Name' coincidan con los nombres de cada una de las columnas del archivo 'counts.csv'. Para ello, es posible utilizar la función gsub para sustituir el carácter . por el carácter -.
+
+
+```{r}
+names(counts) <- gsub(x=names(counts), pattern = "\\.", replacement = "-")
+```
+
+
+Para obtener el archivo 'counts.pec' con los datos de 'counts' de las muestras seleccionadas en el archivo 'targets.pec', se usa la función select del paquete dyplr:
+
+```{r}
+counts.pec <- counts %>% select(one_of(as.character(targets.pec$Sample_Name)))
+str(counts.pec)
+```
+
+Esta matriz de contaje contiene en cada fila un gen con el código Ensembl y cada una de las librerias RNA secuenciadas en las columnas con los respectivos valores asignados.
+
+Es posible comprobar que las filas del archivo 'targets.pec' coincida con las columnas del archivo 'counts.pec':
+```{r}
+all(rownames(targets.pec$Sample_Name) == colnames(counts.pec))
+```
+
+
+```{r}
+write.csv(targets.pec, "./Datos/targets.pec.csv")
+write.csv(counts.pec, "./Datos/counts.pec.csv")
+```
+
+
+
+
+
+A continuación, se crea la matriz del objeto DESeqDataSet que consta de los contajes (counts.pec) y la tabla de información de las muestas (targets.pec), mediante funciones del paquete *DESeq2*.
+La fórmula de diseño define qué columnas de la tabla de información de las muestras (targets.pec) especifica el diseño experimental y cómo estos factores deben usarse en el análisis. Como queremos determinar el efecto de los distintos grupos NIT, SFI y ELI, la fórmula de diseño será ~ Group. 
+
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("DESeq2")
+```
+
+
+
+```{r}
+library("DESeq2")
+```
+
+
+
+DESeq2 offers transformations for count data that stabilize the variance across the mean: the regularized logarithm (rlog) and the variance stabilizing transformation (VST). These have slightly different implementations, discussed a bit in the DESeq2 paper and in the very extensive web tutorial, but a similar goal of stablizing the variance across the range of values. Both produce log2-like values for high counts. Here we will use the regularized log transformation implemented with the rlog function.
+
+
+```{r}
+ddsM <- DESeqDataSetFromMatrix(countData = counts.pec, colData = targets.pec, design = ~Group)
+ddsM
+```
+
+
+
+
+
+
+# Preprocesado de los datos: filtraje y normalización
+
+Con el objetivo de visualizar relaciones entre las muestras, primeramente se van a realizar transformaciones en los contajes y seguidamente se van a realizar test estadísticos sobre los mismos.
+
+
+
+
+
+```{r}
+boxplot(counts.pec, names = c(rep(" ",30)), outcol = c(rep("palegreen3",10),rep("cornflowerblue",10),rep("coral1",10)), xaxt="n", main = "Counts por muestras", xlab = "Muestras para el análisis", ylab = "Counts", cex.lab = 0.8, cex.main=1)
+legend("topright",legend=c("NIT","SFI","ELI"), text.col=c("palegreen3","cornflowerblue","coral1"), cex=0.8, title = "Treatment", title.col = "black")
+```
+
+
+
+
+
+
+
+
+## Pre-filtrado de los datos
+
+Este paso consiste en eliminar esas líneas que menos de 10 reads con el objetivo de reducir las dimensiones del objeto de datos y así incrementar la velocidad de las funciones, ya que no aportan información al análisis. (que seria un cpm de 0.5)
+
+Así, se observa que el objeto inicial contiene 56202 líneas.
+
+```{r}
+nrow(ddsM)
+```
+
+Para filtrar estos datos, se seleccionan todas aquellas líneas que contienen almenos dos contajes en las treinta muestras. 
+
+```{r}
+dds <- ddsM[rowSums(counts(ddsM)) >= 10, ]
+nrow(dds)
+```
+
+Ahora se observa que el objeto contiene 36091 líneas, es decir, se han eliminado 12815 códigos de genes que no aportan información de expresión diferencial al análisis. 
+
+
+
+For transformation: 
+The point of these two transformations, the VST and the rlog, is to remove the dependence of the variance on the mean, particularly the high variance of the logarithm of count data when the mean is low. Both VST and rlog use the experiment-wide trend of variance over mean, in order to transform the data to remove the experiment-wide trend. Note that we do not require or desire that all the genes have exactly the same variance after transformation. Indeed, in a figure below, you will see that after the transformations the genes with the same mean do not have exactly the same standard deviations, but that the experiment-wide trend has flattened. It is those genes with row variance above the trend which will allow us to cluster samples into interesting groups.
+
+
+
+## Transformación para varianza estable y rlog
+
+Muchos métodos estadísticos requieren que la varianza sea homogénea entre las muestras, es decir, requieren homocedasticidad. El paquete *DESeq2* ofrece dos transformaciones para contajes de RNA-seq para estabilizar la varianza: la función *Vst* y la función *rlog*.
+
+Se realiza primeramente una transformación con la función *vst*, ya que nuestros datos contienen 30 muestras, con el atributo blind en *FALSE*, pues en esta primera transformación no quieren establecerse diferencias entre los grupos. 
+
+```{r}
+vsd <- vst(dds, blind=FALSE)
+```
+
+
+
+A ctontinuación se realiza la otra función de transformación:
+
+```{r}
+rld <- rlog(dds, blind=FALSE)
+```
+
+
+
+
+Para mostrar el efecto de la transformación se muestran en los siguientes plots:
+
+
+```{r}
+BiocManager::install("hexbin")
+```
+
+
+```{r}
+library("ggplot2")
+library("hexbin")
+ddsN <- estimateSizeFactors(dds)
+df <- bind_rows(
+  as_data_frame(log2(counts(ddsN, normalized=TRUE)[, 1:2]+1)) %>% mutate(transformation = "log2(x+1)"),
+  as_data_frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"), as_data_frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog")
+)
+colnames(df)[1:2] <- c("x","y")
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) + coord_fixed() + facet_grid( . ~transformation)
+```
+
+A la izquierda se observan los contajes normalizados transformados log2, con la transformación rlog en el medio y a la derecha se encuentran los datos transformados con VST. Se observa como las transformaciones vst y rlog muestran diferencias por los genes con muy bajos contajes, ya que estos datos dan poca información sobre expresión diferencial.
+
+The trend typically captures high dispersions for low counts, and therefore these genes exhibit higher shrinkage from the rlog.
+
+
+
+
+
+
+
+## Normalization:
+
+
+
+
+
+```{r}
+BiocManager::install("edgeR")
+```
+
+
+```{r}
+library("edgeR")
+logcounts <- cpm(counts.pec, log=TRUE)
+boxplot(logcounts, names = c(rep(" ",30)), col = c(rep("palegreen3",10),rep("cornflowerblue",10),rep("coral1",10)), outcol = c(rep("palegreen3",10),rep("cornflowerblue",10),rep("coral1",10)), ylab = "Log2 counts per million", las=2, cex.lab = 0.8)
+abline(h=median(logcounts), col="red")
+title("Boxplots of logCPMs (unnormalised)", cex.main = 1)
+legend("topright",legend=c("NIT","SFI","ELI"), text.col=c("palegreen3","cornflowerblue","coral1"), cex=0.8, title = "Treatment", title.col = "black")
+```
+
+```{r}
+ddsN = estimateSizeFactors(dds)
+```
+
+
+
+
+```{r}
+normcounts <- cpm(ddsN, log = TRUE)
+boxplot(normcounts, names = c(rep(" ",30)), col = c(rep("palegreen3",10),rep("cornflowerblue",10),rep("coral1",10)), ylab = "Log2 counts per million", las=2, cex.lab = 0.8)
+abline(h=median(normcounts), col="red")
+title("Boxplots of logCPMs (normalised)", cex.main = 1)
+legend("topright",legend=c("NIT","SFI","ELI"), text.col=c("palegreen3","cornflowerblue","coral1"), cex=0.8, title = "Treatment", title.col = "black")
+```
+
+Els valors de mediana son mas parecidos ahora. 
+
+
+
+
+
+
+
+
+
+
+
+
+# Visualización de los datos
+
+
+## Distancias entre las muestras
+
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+```
+
+
+Ahora visualizamos estas distancias en un mapa de calor con la función pheatmap añadiendo las distancias entre las muestras como argumento para generar clusters entre las muestras. 
+
+```{r}
+BiocManager::install("pheatmap")
+BiocManager::install("RColorBrewer")
+```
+
+
+
+
+```{r}
+library("pheatmap")
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$Group, sep = " - ")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(30, "Blues")) )(255)
+pdf("pheatmap1.pdf")
+pheatmap1 <- pheatmap(sampleDistMatrix, clustering_distance_rows  = sampleDists, clustering_distance_cols = sampleDists, col = colors)
+dev.off()
+```
+
+
+
+
+```{r}
+BiocManager::install("PoiClaClu")
+```
+
+
+
+```{r}
+library("PoiClaClu")
+poisd <- PoissonDistance(t(counts(dds)))
+samplePoisDistMatrix <- as.matrix( poisd$dd )
+rownames(samplePoisDistMatrix) <- paste( dds$Group, sep=" - " )
+colnames(samplePoisDistMatrix) <- NULL
+pheatmap(samplePoisDistMatrix,
+         clustering_distance_rows = poisd$dd,
+         clustering_distance_cols = poisd$dd,
+         col = colors)
+```
+
+
+
+
+## PCA Plot
+
+```{r}
+plotPCA(vsd, intgroup = c("Group"))
+```
+
+Se observa una separación entre los distintos grupos, aunque también hay algunas muestras que se disipan con otros grupos. 
+
+(afegir glm-pca?)
+
+
+
+
+
+
+
+
+## MDS plot (Multidimensional scaling plots)
+
+```{r}
+mds <- as.data.frame(colData(vsd)) %>% cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = Group)) + geom_point(size=3) + coord_fixed() + ggtitle("MDS con los datos VSD")
+```
+
+
+```{r}
+pdf("PCAandMDS.pdf")
+par(mfrow=c(1,2))
+plotPCA(vsd, intgroup = c("Group"))
+mds <- as.data.frame(colData(vsd)) %>% cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = Group)) + geom_point(size=3) + coord_fixed() + ggtitle("MDS con los datos VSD")
+dev.off()
+```
+
+
+
+
+
+
+
+
+# Análisis de expresión diferencial entre grupos
+
+```{r}
+dds <- DESeq(dds, parallel = TRUE)
+```
+
+La función DESeq lleva a cabo las siguientes tres funciones en los datos crudos: estimateSizeFactors(dds), estimateDispersions(dds) y nbinomWaldTest(dds).
+The results function of the DESeq2 package performs independent filtering by default using the mean of normalized counts as a filter statistic. A threshold on the filter statistic is found which optimizes the number of adjusted p values lower than a [specified] significance level”.
+
+
+
+
+
+La variable *Group* contiene tres niveles, que pueden compararse dos a dos, mostrando así las tablas resultado de las distintas comparaciones:
+con un filtraje independiente de alpha 0.5. 
+
+## NIT vs SFI
+
+```{r}
+res_NITvsSFI <- results(dds, contrast=c("Group","NIT","SFI"), alpha=0.05)
+head(res_NITvsSFI)
+summary(res_NITvsSFI)
+```
+Se observan 112 genes sobreexpresados y 98 genes downregulados.
+Decir que se podria tambien añadir un lindar para el foldchange, con lfcThreshold=0.5, por ejemplo. 
+
+Si se considera una fracción de falsos positivos del 10% como aceptable se pueden ordenar mediatne el parámetro de fold change para obtener los genes significates con mayor downregulación y upregulación:
+
+```{r}
+resSig_NITvsSFI <- subset(res_NITvsSFI, padj <= 0.05)
+head(resSig_NITvsSFI[ order(resSig_NITvsSFI$log2FoldChange), ])
+```
+
+```{r}
+head(resSig_NITvsSFI[ order(resSig_NITvsSFI$log2FoldChange, decreasing = TRUE), ])
+```
+
+```{r}
+library("xlsx")
+write.csv(resSig_NITvsSFI, "./Resultados/resSig_NITvsSFI.csv")
+write.xlsx(resSig_NITvsSFI, "./Resultados/resSig_NITvsSFI.xlsx")
+```
+
+
+
+The first column, baseMean, is a just the average of the normalized count values, dividing by size factors, taken over all samples. The remaining four columns refer to a specific contrast, namely the comparison of the levels DPN versus Control of the factor variable treatment.
+
+See the help page for results (by typing ?results) for information on how to obtain other contrasts.
+
+The column log2FoldChange is the effect size estimate. It tells us how much the gene’s expression seems to have changed due to treatment with DPN in comparison to control.
+
+NA = means that all counts for that gene are zero, and hence no test was applied. 
+
+Samllest p-value:
+```{r}
+idx <- which.min(res_NITvsSFI$pvalue)
+counts(dds, normalized = TRUE)[idx,]
+```
+
+
+
+
+
+
+
+
+
+
+
+
+## NIT vs ELI
+
+```{r}
+res_NITvsELI <- results(dds, contrast=c("Group","NIT","ELI"), alpha = 0.05)
+head(res_NITvsELI)
+summary(res_NITvsELI)
+```
+Se observan 112 genes sobreexpresados y 98 genes downregulados.
+
+Si se considera una fracción de falsos positivos del 10% como aceptable se pueden ordenar mediatne el parámetro de fold change para obtener los genes significates con mayor downregulación y upregulación:
+
+```{r}
+resSig_NITvsELI <- subset(res_NITvsELI, padj <= 0.05)
+head(resSig_NITvsELI[ order(resSig_NITvsELI$log2FoldChange), ])
+```
+
+```{r}
+head(resSig_NITvsELI[ order(resSig_NITvsELI$log2FoldChange, decreasing = TRUE), ])
+```
+
+```{r}
+write.xlsx(resSig_NITvsELI, "./Resultados/resSig_NITvsELI.xlsx")
+```
+
+
+
+## SFI vs ELI
+
+```{r}
+res_SFIvsELI <- results(dds, contrast=c("Group","SFI","ELI"), alpha = 0.05)
+head(res_SFIvsELI)
+summary(res_SFIvsELI)
+```
+Se observan 112 genes sobreexpresados y 98 genes downregulados.
+
+Si se considera una fracción de falsos positivos del 10% como aceptable se pueden ordenar mediatne el parámetro de fold change para obtener los genes significates con mayor downregulación y upregulación:
+
+```{r}
+resSig_SFIvsELI <- subset(res_SFIvsELI, padj <= 0.05)
+head(resSig_SFIvsELI[ order(resSig_SFIvsELI$log2FoldChange), ])
+```
+
+```{r}
+head(resSig_SFIvsELI[ order(resSig_SFIvsELI$log2FoldChange, decreasing = TRUE), ])
+```
+
+```{r}
+write.xlsx(resSig_SFIvsELI, "./Resultados/resSig_SFIvsELI.xlsx")
+```
+
+
+
+
+
+# Visualización de patrones de expresión
+
+```{r}
+BiocManager::install("apeglm")
+```
+
+
+```{r}
+resultsNames(dds)
+```
+
+
+
+
+
+
+
+
+
+
+
+## MA-Plot
+
+```{r}
+DESeq2::plotMA(res_NITvsSFI, ylim = c(-8,8))
+topGene1 <- rownames(res_NITvsSFI)[which.min(res_NITvsSFI$padj)]
+with(res_NITvsSFI[topGene1, ], {
+  points(baseMean, log2FoldChange, col = "dodgerblue", cex = 2, lwd = 2) 
+  text(baseMean, log2FoldChange, topGene1, pos = 2, col = "dodgerblue")
+})
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+title("MA-plot NITvsSFI")
+```
+
+```{r}
+DESeq2::plotMA(res_NITvsELI, ylim = c(-8,8))
+topGene2 <- rownames(res_NITvsELI)[which.min(res_NITvsELI$padj)]
+with(res_NITvsELI[topGene2, ], {
+  points(baseMean, log2FoldChange, col = "dodgerblue", cex = 2, lwd = 2) 
+  text(baseMean, log2FoldChange, topGene2, pos = 2, col = "dodgerblue")
+})
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+title("MA-plot NITvsELI")
+```
+
+
+```{r}
+DESeq2::plotMA(res_SFIvsELI, ylim = c(-8,8))
+topGene3 <- rownames(res_SFIvsELI)[which.min(res_SFIvsELI$padj)]
+with(res_SFIvsELI[topGene3, ], {
+  points(baseMean, log2FoldChange, col = "dodgerblue", cex = 2, lwd = 2) 
+  text(baseMean, log2FoldChange, topGene3, pos = 2, col = "dodgerblue")
+})
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+title("MA-plot SFIvsELI")
+```
+
+**Mirar si fer amb lfcShrink:**
+
+
+
+
+
+
+
+## Histograma de los p-valores
+
+```{r}
+hist(res_NITvsSFI$pvalue[res_NITvsSFI$baseMean > 1], breaks = 0:50/50, col = "grey70", border = "white", main = "Histograma de p-valores NITvsSFI", cex.main = 1, ylab = "Frecuencia", xlab = "p-value", cex.lab = 0.8)
+```
+Mirar teoria DESEQ2 from Michael I. Love.
+
+
+```{r}
+hist(res_NITvsELI$pvalue[res_NITvsELI$baseMean > 1], breaks = 0:50/50, col = "grey70", border = "white", main = "Histograma de p-valores NITvsELI", cex.main = 1, ylab = "Frecuencia", xlab = "p-value", cex.lab = 0.8)
+```
+
+
+```{r}
+hist(res_SFIvsELI$pvalue[res_SFIvsELI$baseMean > 1], breaks = 0:50/50, col = "grey70", border = "white", main = "Histograma de p-valores SFIvsELI", cex.main = 1, ylab = "Frecuencia", xlab = "p-value", cex.lab = 0.8)
+```
+
+
+## Dispersion plot and fitting alternatives
+
+```{r}
+plotDispEsts(dds)
+```
+
+
+
+
+
+## Gene clustering
+
+```{r}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+topVarGenes
+```
+
+
+
+
+```{r}
+mat <- assay(vsd)[topVarGenes, ]
+mat <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)["Group"])
+pdf("pheatmap2.pdf")
+pheatmap2 <- pheatmap(mat, annotation_col = anno)
+dev.off()
+```
+
+
+## Independent filtering
+
+Una de las debilidades de los datos RNAseq es que los genes poco expresados no es posible ver expresion diferencial, debido al ruido de fondo. 
+
+```{r}
+qs <- c(0, quantile(res_NITvsSFI$baseMean[res_NITvsSFI$baseMean > 0], 0:6/6))
+bins <- cut(res_NITvsSFI$baseMean, qs)
+levels(bins) <- paste0("~", round(signif((qs[-1] + qs[-length(qs)])/2, 2)))
+fractionSig <- tapply(res_NITvsSFI$pvalue, bins, function(p)
+                          mean(p < .05, na.rm = TRUE))
+barplot(fractionSig, xlab = "mean normalized count",
+                     ylab = "fraction of small p values")
+```
+
+Este gráfico muestra que los genes con contajes muy bajos no tienen poder y estan excluidos del test. Estos genes tienen cierta influencia en el ajuste de testado múltiple, y su ejecución mejora cuando estos genes son excluidos. 
+
+
+
+
+
+
+## Comparación entre distintas comparaciones
+
+
+
+
+```{r}
+res_NITvsSFI.genes <- row.names(resSig_NITvsSFI)
+res_NITvsELI.genes <- row.names(resSig_NITvsELI)
+res_SFIvsELI.genes <- row.names(resSig_SFIvsELI)
+```
+
+
+
+
+
+```{r}
+comb <- c(res_NITvsSFI.genes,res_NITvsELI.genes,res_SFIvsELI.genes)
+```
+
+```{r}
+res_NITvsSFI.genes.2 <- comb %in% res_NITvsSFI.genes
+res_NITvsELI.genes.2 <- comb %in% res_NITvsELI.genes
+res_SFIvsELI.genes.2 <- comb %in% res_SFIvsELI.genes
+```
+
+
+
+
+```{r}
+venn_counts <- cbind(res_NITvsSFI.genes.2, res_NITvsELI.genes.2, res_SFIvsELI.genes.2)
+venn_counts_results <- vennCounts(venn_counts)
+vennDiagram(venn_counts_results, cex = 1, names=c("NITvsSFI","NITvsELI","SFIvsELI"), circle.col=c("palegreen3","cornflowerblue","coral1"))
+```
+
+
+
+
+
+
+
+
+
+
+
+# Anotación de los resultados
+
+
+```{r}
+BiocManager::install("AnnotationDbi")
+BiocManager::install("org.Hs.eg.db")
+```
+
+
+
+```{r}
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+columns(org.Hs.eg.db)
+```
+
+
+
+To remove the string after the period:
+
+```{r}
+row.names(res_NITvsSFI) <- gsub(x=row.names(res_NITvsSFI), pattern = "\\..*", replacement = "")
+row.names(res_NITvsELI) <- gsub(x=row.names(res_NITvsELI), pattern = "\\..*", replacement = "")
+row.names(res_SFIvsELI) <- gsub(x=row.names(res_SFIvsELI), pattern = "\\..*", replacement = "")
+```
+
+
+
+
+```{r}
+res_NITvsSFI$symbol <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsSFI), column = "SYMBOL", keytype="ENSEMBL", multiVals = "first")
+res_NITvsSFI$entrez <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsSFI), column = "ENTREZID", keytype="ENSEMBL", multiVals = "first")
+res_NITvsSFI$genename <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsSFI), column = "GENENAME", keytype="ENSEMBL", multiVals = "first")
+```
+
+```{r}
+res_NITvsSFI_Ordered <- res_NITvsSFI[order(res_NITvsSFI$pvalue),]
+res_NITvsSFI_Annot <- res_NITvsSFI_Ordered[which(res_NITvsSFI_Ordered$symbol != "NA"), ]
+head(res_NITvsSFI_Annot) 
+```
+
+
+
+```{r}
+res_NITvsELI$symbol <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsELI), column = "SYMBOL", keytype="ENSEMBL",  multiVals = "first")
+res_NITvsELI$entrez <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsELI), column = "ENTREZID", keytype="ENSEMBL", multiVals = "first")
+res_NITvsELI$genename <- mapIds(org.Hs.eg.db, keys=row.names(res_NITvsELI), column = "GENENAME", keytype="ENSEMBL", multiVals = "first")
+```
+
+
+```{r}
+res_NITvsELI_Ordered <- res_NITvsELI[order(res_NITvsELI$pvalue),]
+res_NITvsELI_Annot <- res_NITvsELI_Ordered[which(res_NITvsELI_Ordered$symbol != "NA"), ]
+head(res_NITvsELI_Annot) 
+```
+
+
+
+
+```{r}
+res_SFIvsELI$symbol <- mapIds(org.Hs.eg.db, keys=row.names(res_SFIvsELI), column = "SYMBOL", keytype="ENSEMBL", multiVals = "first")
+res_SFIvsELI$entrez <- mapIds(org.Hs.eg.db, keys=row.names(res_SFIvsELI), column = "ENTREZID", keytype="ENSEMBL", multiVals = "first")
+res_SFIvsELI$genename <- mapIds(org.Hs.eg.db, keys=row.names(res_SFIvsELI), column = "GENENAME", keytype="ENSEMBL", multiVals = "first")
+```
+
+
+```{r}
+res_SFIvsELI_Ordered <- res_SFIvsELI[order(res_SFIvsELI$pvalue),]
+res_SFIvsELI_Annot <- res_SFIvsELI_Ordered[which(res_SFIvsELI_Ordered$symbol != "NA"), ]
+head(res_SFIvsELI_Annot) 
+```
+
+```{r}
+write.xlsx(res_SFIvsELI_Annot, "./Resultados/res_SFIvsELI_Annot.xlsx")
+```
+
+
+## Volcano plots:
+
+
+```{r}
+genesymbols1 <- res_NITvsSFI_Annot$symbol
+pdf("volcano_NITvsSFI.pdf")
+volcano_NITvsSFI <- plot(res_NITvsSFI_Annot$log2FoldChange, -log10(res_NITvsSFI_Annot$padj), panel.first = grid(), main = "Volcano plot NITvsSFI", xlab="Effect size: log2 Fold-change", ylab="-log10(adj p-value)", pch=20, cex=0.6)
+abline(v=0)
+abline(v=c(-1,1), col="dodgerblue")
+abline(h=-log10(0.05), col="dodgerblue")
+gn.selected <- abs(res_NITvsSFI_Annot$log2FoldChange) > 2.5 & res_NITvsSFI_Annot$padj < 0.05 
+text(res_NITvsSFI_Annot$log2FoldChange[gn.selected],
+     -log10(res_NITvsSFI_Annot$padj)[gn.selected],
+     lab=genesymbols1[gn.selected], cex=0.4)
+dev.off()
+```
+
+
+```{r}
+genesymbols2 <- res_NITvsELI_Annot$symbol
+pdf("volcano_NITvsELI.pdf")
+volano_NITvsELI <- plot(res_NITvsELI_Annot$log2FoldChange, -log10(res_NITvsELI_Annot$padj), panel.first = grid(), main = "Volcano plot NITvsELI", xlab="Effect size: log2 Fold-change", ylab="-log10(adj p-value)", pch=20, cex=0.6)
+abline(v=0)
+abline(v=c(-1,1), col="dodgerblue")
+abline(h=-log10(0.05), col="dodgerblue")
+gn.selected <- abs(res_NITvsELI_Annot$log2FoldChange) > 4 & res_NITvsELI_Annot$padj < 0.05 
+text(res_NITvsELI_Annot$log2FoldChange[gn.selected],
+     -log10(res_NITvsELI_Annot$padj)[gn.selected],
+     lab=genesymbols2[gn.selected], cex=0.4)
+dev.off()
+```
+
+```{r}
+genesymbols3 <- res_SFIvsELI_Annot$symbol
+pdf("volcano_SFIvsELI.pdf")
+volcano_SFIvsELI <- plot(res_SFIvsELI_Annot$log2FoldChange, -log10(res_SFIvsELI_Annot$padj), panel.first = grid(), main = "Volcano plot SFIvsELI", xlab="Effect size: log2 Fold-change", ylab="-log10(adj p-value)", pch=20, cex=0.6)
+abline(v=0)
+abline(v=c(-1,1), col="dodgerblue")
+abline(h=-log10(0.05), col="dodgerblue")
+gn.selected <- abs(res_SFIvsELI_Annot$log2FoldChange) > 4 & res_SFIvsELI_Annot$padj < 0.05 
+text(res_SFIvsELI_Annot$log2FoldChange[gn.selected],
+     -log10(res_SFIvsELI_Annot$padj)[gn.selected],
+     lab=genesymbols3[gn.selected], cex=0.4)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+# Análisis de significación biológica
+
+```{r}
+BiocManager::install("clusterProfiler")
+BiocManager::install("xlsx")
+```
+
+
+```{r}
+library(clusterProfiler)
+```
+
+
+
+```{r}
+GO_NITvsSFI <- as.data.frame(res_NITvsSFI_Annot)
+head(GO_NITvsSFI)
+GO_NITvsELI <- as.data.frame(res_NITvsELI_Annot)
+head(GO_NITvsELI)
+GO_SFIvsELI <- as.data.frame(res_SFIvsELI_Annot)
+head(GO_SFIvsELI)
+```
+
+
+
+
+
+
+
+
+```{r}
+library("dplyr")
+library("xlsx")
+universe_prova <- list(NITvsSFI = GO_NITvsSFI$entrez, NITvsELI = GO_NITvsELI$entrez, SFIvsELI = GO_SFIvsELI$entrez)
+func <- function(x) {
+  x %>% filter(padj < 0.05, !is.na(entrez)) %>% pull(entrez)
+}
+sigGenes_prova <- list(NITvsSFI = GO_NITvsSFI, NITvsELI = GO_NITvsELI, SFIvsELI = GO_SFIvsELI) %>% lapply(func)
+comparisonsNames <- names(sigGenes_prova)
+
+for (i in 1:length(sigGenes_prova)){
+  genesIn <- sigGenes_prova[[i]]
+  comparison <- comparisonsNames[i]
+  enrich.result <- enrichGO(gene = genesIn, OrgDb = org.Hs.eg.db, ont = "ALL", pAdjustMethod = "BH", pvalueCutoff = 0.05, universe = universe_prova, readable = TRUE)
+
+cat("##################################")
+ cat("\nComparison: ", comparison,"\n")
+ print(head(enrich.result))
+
+if (length(rownames(enrich.result@result)) != 0) {
+ write.csv(as.data.frame(enrich.result), 
+            file =paste0("./Resultados/","Enrich.Results.",comparison,".csv"), 
+            row.names = FALSE)
+
+write.xlsx(as.data.frame(enrich.result), 
+            file =paste0("./Resultados/","Enrich.Results.",comparison,".xlsx"), 
+            row.names = FALSE) 
+
+ pdf(file=paste0("./Resultados/","Enrich.Dotplot.",comparison,".pdf"))
+   print(dotplot(enrich.result, showCategory = 15, font.size = 6, 
+           title = paste0("EnrichGO Pathway Analysis for ", comparison,". Dotplot")))
+ dev.off()
+
+ pdf(file = paste0("./Resultados/","EnrichGOemapplot.",comparison,".pdf"))
+   print(emapplot(enrich.result, categorySize = "geneNum", schowCategory = 15, 
+        vertex.label.cex = 0.75))
+ dev.off()
+
+ }
+}
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+BiocManager::install("clusterProfiler")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
